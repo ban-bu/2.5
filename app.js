@@ -822,6 +822,228 @@ function initVoiceCall() {
     console.log('✅ 语音通话功能初始化完成');
 }
 
+// ==================== 实时转录（科大讯飞 RTASR） ====================
+let isTranscribing = false;
+let transcriptionWs = null;
+let transcriptionStream = null;
+let audioProcessorNode = null;
+let audioContext = null;
+let transcriptionSentFirstFrame = false;
+
+async function toggleTranscription() {
+    if (isTranscribing) {
+        stopTranscription();
+    } else {
+        startTranscription();
+    }
+}
+
+async function startTranscription() {
+    if (isTranscribing) return;
+    try {
+        const panel = document.getElementById('transcriptionPanel');
+        if (panel) panel.style.display = 'block';
+
+        // 拿到服务端生成的 RTASR 已签名 ws 地址
+        const resp = await fetch('/api/transcription/iflytek/rtasr-url');
+        const data = await resp.json();
+        if (!data.url) throw new Error('无法获取转写服务地址');
+
+        // 采集音频，单声道 16kHz
+        const stream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+                channelCount: 1,
+                sampleRate: 16000,
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            }
+        });
+        transcriptionStream = stream;
+
+        audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+        const source = audioContext.createMediaStreamSource(stream);
+
+        // 使用 ScriptProcessor 将 float32 转为 16k 16bit PCM 按块发送
+        const bufferSize = 1024; // 更小缓冲，增强调度，~64ms/块
+        audioProcessorNode = audioContext.createScriptProcessor(bufferSize, 1, 1);
+        source.connect(audioProcessorNode);
+        audioProcessorNode.connect(audioContext.destination);
+
+        transcriptionWs = new WebSocket(data.url);
+        transcriptionWs.binaryType = 'arraybuffer';
+
+        transcriptionWs.onopen = () => {
+            isTranscribing = true;
+            updateTranscribeBtn(true);
+            appendTranscriptionStatus('已连接转写服务，开始转写...');
+        };
+
+        transcriptionWs.onerror = (e) => {
+            appendTranscriptionStatus('转写连接错误');
+            console.error('RTASR ws error', e);
+            stopTranscription();
+        };
+
+        transcriptionWs.onclose = () => {
+            appendTranscriptionStatus('转写连接已关闭');
+            updateTranscribeBtn(false);
+            isTranscribing = false;
+        };
+
+        transcriptionWs.onmessage = (event) => {
+            try {
+                const msg = JSON.parse(event.data);
+                // 兼容 RTASR 返回：result_type: partial/final, data: text 或 cn.st.rt 返回结构
+                const text = extractIflytekText(msg);
+                if (text) appendTranscriptionText(text);
+            } catch {
+                // 有时服务会返回纯文本
+                if (typeof event.data === 'string' && event.data.trim()) {
+                    appendTranscriptionText(event.data.trim());
+                }
+            }
+        };
+
+        transcriptionSentFirstFrame = false;
+        audioProcessorNode.onaudioprocess = (e) => {
+            if (!isTranscribing || !transcriptionWs || transcriptionWs.readyState !== 1) return;
+            const input = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
+            // 转为 16-bit PCM Little Endian
+            const pcmBuffer = floatTo16BitPCM(input);
+            const base64Audio = arrayBufferToBase64(pcmBuffer);
+
+            // 讯飞 RTASR 帧：status 0 首帧，1 中间帧，2 结束帧
+            const frame = {
+                data: {
+                    status: transcriptionSentFirstFrame ? 1 : 0,
+                    format: 'audio/L16;rate=16000',
+                    audio: base64Audio,
+                    encoding: 'raw'
+                }
+            };
+            try {
+                transcriptionWs.send(JSON.stringify(frame));
+                transcriptionSentFirstFrame = true;
+            } catch (err) {
+                console.error('发送音频失败', err);
+            }
+        };
+
+        showToast('已开启实时转录', 'success');
+    } catch (err) {
+        console.error('开启实时转录失败', err);
+        showToast('开启实时转录失败：' + (err.message || ''), 'error');
+        stopTranscription();
+    }
+}
+
+function stopTranscription() {
+    if (audioProcessorNode) {
+        audioProcessorNode.disconnect();
+        audioProcessorNode.onaudioprocess = null;
+        audioProcessorNode = null;
+    }
+    if (audioContext) {
+        try { audioContext.close(); } catch {}
+        audioContext = null;
+    }
+    if (transcriptionStream) {
+        transcriptionStream.getTracks().forEach(t => t.stop());
+        transcriptionStream = null;
+    }
+    if (transcriptionWs) {
+        try {
+            // 发送结束帧
+            if (transcriptionWs.readyState === 1) {
+                const endFrame = { data: { status: 2, audio: '' } };
+                transcriptionWs.send(JSON.stringify(endFrame));
+            }
+        } catch {}
+        try { transcriptionWs.close(); } catch {}
+        transcriptionWs = null;
+    }
+    isTranscribing = false;
+    updateTranscribeBtn(false);
+}
+
+function updateTranscribeBtn(active) {
+    const btn = document.getElementById('transcribeBtn');
+    if (!btn) return;
+    if (active) {
+        btn.classList.add('in-call');
+        btn.innerHTML = '<i class="fas fa-closed-captioning"></i>';
+        btn.style.background = '#2563eb';
+    } else {
+        btn.classList.remove('in-call');
+        btn.innerHTML = '<i class="fas fa-closed-captioning"></i>';
+        btn.style.background = '';
+    }
+}
+
+function appendTranscriptionStatus(status) {
+    const content = document.getElementById('transcriptionContent');
+    if (!content) return;
+    const div = document.createElement('div');
+    div.className = 'transcription-status';
+    div.innerHTML = `<i class="fas fa-microphone"></i> <span>${status}</span>`;
+    content.appendChild(div);
+    content.scrollTop = content.scrollHeight;
+}
+
+function appendTranscriptionText(text) {
+    const content = document.getElementById('transcriptionContent');
+    if (!content || !text) return;
+    const p = document.createElement('p');
+    p.textContent = text;
+    content.appendChild(p);
+    content.scrollTop = content.scrollHeight;
+}
+
+function closeTranscription() {
+    const panel = document.getElementById('transcriptionPanel');
+    if (panel) panel.style.display = 'none';
+}
+
+function floatTo16BitPCM(float32Array) {
+    const buffer = new ArrayBuffer(float32Array.length * 2);
+    const view = new DataView(buffer);
+    let offset = 0;
+    for (let i = 0; i < float32Array.length; i++, offset += 2) {
+        let s = Math.max(-1, Math.min(1, float32Array[i]));
+        view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+    }
+    return buffer;
+}
+
+function arrayBufferToBase64(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = '';
+    const len = bytes.byteLength;
+    for (let i = 0; i < len; i++) {
+        binary += String.fromCharCode(bytes[i]);
+    }
+    return btoa(binary);
+}
+
+// 粗略兼容讯飞返回结构，提取文本
+function extractIflytekText(msg) {
+    // 常见结构：{ code, message, data: { result: { ws:[{ cw:[{ w: '词' }] }] }, status: 0/2 } }
+    // 或 { action: 'started/failed/...' } 等
+    if (!msg) return '';
+    if (msg.data && msg.data.result && Array.isArray(msg.data.result.ws)) {
+        const ws = msg.data.result.ws;
+        const words = [];
+        ws.forEach(w => {
+            if (w.cw && w.cw[0] && w.cw[0].w) words.push(w.cw[0].w);
+        });
+        return words.join('');
+    }
+    if (msg.result && msg.result.length) return msg.result; // 有些文档示例
+    if (msg.text) return msg.text;
+    return '';
+}
+
 // 测试麦克风权限
 async function testMicrophonePermission() {
     const testMicBtn = document.getElementById('testMicBtn');

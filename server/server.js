@@ -5,6 +5,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
 const { RateLimiterMemory } = require('rate-limiter-flexible');
 require('dotenv').config();
 
@@ -890,6 +891,26 @@ app.get('/api/rooms/:roomId/participants', async (req, res) => {
     } catch (error) {
         logger.error('获取参与者失败: ' + error.message);
         res.status(500).json({ error: '获取参与者失败' });
+    }
+});
+
+// 讯飞 RTASR 鉴权签名与 WebSocket URL 生成
+// 安全起见在服务端计算 signa，前端仅拿已签名的 ws 地址
+app.get('/api/transcription/iflytek/rtasr-url', (req, res) => {
+    try {
+        const appId = process.env.IFLYTEK_APPID || '84959f16';
+        const apiKey = process.env.IFLYTEK_APIKEY || '065eee5163baa4692717b923323e6853';
+        const ts = Math.floor(Date.now() / 1000).toString();
+
+        // signa = base64(hmac_sha1(apiKey, md5(appid + ts)))
+        const md5sum = crypto.createHash('md5').update(appId + ts).digest('hex');
+        const signa = crypto.createHmac('sha1', apiKey).update(md5sum).digest('base64');
+
+        const url = `wss://rtasr.xfyun.cn/v1/ws?appid=${encodeURIComponent(appId)}&ts=${encodeURIComponent(ts)}&signa=${encodeURIComponent(signa)}`;
+        res.json({ url, ts });
+    } catch (error) {
+        logger.error('生成讯飞 RTASR URL 失败: ' + error.message);
+        res.status(500).json({ error: '生成讯飞 RTASR URL 失败' });
     }
 });
 
